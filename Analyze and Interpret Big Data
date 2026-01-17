@@ -1,0 +1,114 @@
+import matplotlib
+matplotlib.use('Agg') # Necessary for Ubuntu terminal without a GUI
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import StringIndexer, VectorAssembler
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
+from pyspark.ml import Pipeline
+
+# 1. INITIALIZE SPARK WITH STABILITY CONFIGS
+# We increase timeouts to handle 10 million records without "heartbeater" issues.
+spark = SparkSession.builder \
+    .appName("Task3_Final") \
+    .config("spark.executor.heartbeatInterval", "120s") \
+    .config("spark.network.timeout", "600s") \
+    .getOrCreate()
+
+print("-------LOADING DATA--------------")
+all_columns = [
+    "srcip", "sport", "dstip", "dsport", "proto", "state", "dur", "sbytes", 
+    "dbytes", "sttl", "dttl", "sloss", "dloss", "service", "Sload", "Dload", 
+    "Spkts", "Dpkts", "swin", "dwin", "stcpb", "dtcpb", "smeansz", "dmeansz", 
+    "trans_depth", "res_bdy_len", "Sjit", "Djit", "Stime", "Ltime", "Sintpkt", 
+    "Dintpkt", "tcprtt", "synack", "ackdat", "is_sm_ips_ports", "ct_state_ttl", 
+    "ct_flw_http_mthd", "is_ftp_login", "ct_ftp_cmd", "ct_srv_src", "ct_srv_dst", 
+    "ct_dst_ltm", "ct_src_ltm", "ct_src_dport_ltm", "ct_dst_sport_ltm", 
+    "ct_dst_src_ltm", "attack_cat", "label"
+]
+
+# Load from HDFS
+raw_df = spark.read.csv("hdfs://localhost:9000/user/raaf09/spark/UNSW-NB15.csv", header=False, inferSchema=True)
+
+# 2. PLACE THE CLEANING CODE HERE
+# This ensures all 'df' usage below this line is clean and error-free
+df = raw_df.toDF(*all_columns).na.drop(subset=["proto", "attack_cat", "label"])
+
+print(f"Total records loaded after cleaning: {df.count()}")
+
+print("-----------PREPROCESSING--------------")
+# Convert categorical columns to numeric
+categorical_cols = ["proto", "state", "service", "attack_cat"]
+# Updated Preprocessing with null handling
+indexers = [
+    StringIndexer(inputCol="proto", outputCol="proto_idx", handleInvalid="skip"),
+    StringIndexer(inputCol="service", outputCol="service_idx", handleInvalid="skip"),
+    StringIndexer(inputCol="state", outputCol="state_idx", handleInvalid="skip"),
+    StringIndexer(inputCol="attack_cat", outputCol="label_multi", handleInvalid="skip")
+]
+# Assemble features (excluding labels)
+feature_cols = [col+"_idx" for col in categorical_cols if col != "attack_cat"] + \
+               ["dur", "sbytes", "dbytes", "sttl", "dttl"]
+assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+
+# Add a specific index for Multi-class labels
+multi_indexer = StringIndexer(inputCol="attack_cat", outputCol="label_multi_index", handleInvalid="skip")
+
+# Prepare final DataFrame
+pipeline_prepare = Pipeline(stages=indexers + [multi_indexer, assembler])
+df_prepared = pipeline_prepare.fit(df).transform(df)
+
+# Split data
+train_data, test_data = df_prepared.randomSplit([0.8, 0.2], seed=42)
+
+print("-----------TRAINING BINARY CLASSIFIER--------------")
+lr = LogisticRegression(featuresCol="features", labelCol="label")
+model_bin = lr.fit(train_data)
+pred_bin = model_bin.transform(test_data)
+
+eval_bin = BinaryClassificationEvaluator(labelCol="label")
+acc_bin = eval_bin.evaluate(pred_bin)
+print(f"Binary Classifier Accuracy: {acc_bin:.4f}")
+
+print("-----------TRAINING MULTI-CLASS CLASSIFIER--------------")
+# We set maxBins=200 because 'proto' has 135 unique values.
+rf = RandomForestClassifier(featuresCol="features", labelCol="label_multi_index", numTrees=10, maxBins=200)
+model_multi = rf.fit(train_data)
+pred_multi = model_multi.transform(test_data)
+
+eval_multi = MulticlassClassificationEvaluator(labelCol="label_multi_index", metricName="accuracy")
+acc_multi = eval_multi.evaluate(pred_multi)
+print(f"Multi-class Classifier Accuracy: {acc_multi:.4f}")
+
+print("-----------GENERATING VISUALIZATION--------------")
+# Fix: Aggregate data and use matching variable names
+print("-----------GENERATING VISUALIZATION--------------")
+
+# 1. Aggregate the 10 million rows into a small summary table
+# Use a distinct variable name and ensure it is collected fully
+print("Summarizing data...")
+summary_df = df.groupBy("attack_cat").count().orderBy("count", ascending=False)
+plot_data = summary_df.toPandas() # This brings only ~10 rows to the local driver
+
+# 2. Check if the dataframe is empty before plotting
+if not plot_data.empty:
+    plt.figure(figsize=(12, 6))
+    
+    # 3. Use Seaborn to create the bar chart
+    sns.barplot(x="attack_cat", y="count", data=plot_data)
+    
+    # 4. Standard formatting for Task 3.1 requirements
+    plt.title("Distribution of Attack Categories (UNSW-NB15)", fontsize=14)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    # 5. CRITICAL: Save the file BEFORE spark.stop()
+    output_path = '/home/raaf09/final_attack_dist.png'
+    plt.savefig(output_path)
+    print(f"Graph successfully saved to: {output_path}")
+else:
+    print("Error: No data found to plot.")
+
+# Final Step: Now it is safe to stop the session
+spark.stop()
