@@ -1,0 +1,63 @@
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import StringIndexer, VectorAssembler
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml import Pipeline
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 1. Initialize Spark with stability configs for 10M records
+spark = SparkSession.builder \
+    .appName("Task3_BinaryClassifier") \
+    .config("spark.executor.heartbeatInterval", "120s") \
+    .config("spark.network.timeout", "600s") \
+    .getOrCreate()
+
+# 2. Data Loading & Cleaning
+# (Column list 'all_columns' as defined in your previous script)
+all_columns = [
+    "srcip", "sport", "dstip", "dsport", "proto", "state", "dur", "sbytes", 
+    "dbytes", "sttl", "dttl", "sloss", "dloss", "service", "Sload", "Dload", 
+    "Spkts", "Dpkts", "swin", "dwin", "stcpb", "dtcpb", "smeansz", "dmeansz", 
+    "trans_depth", "res_bdy_len", "Sjit", "Djit", "Stime", "Ltime", "Sintpkt", 
+    "Dintpkt", "tcprtt", "synack", "ackdat", "is_sm_ips_ports", "ct_state_ttl", 
+    "ct_flw_http_mthd", "is_ftp_login", "ct_ftp_cmd", "ct_srv_src", "ct_srv_dst", 
+    "ct_dst_ltm", "ct_src_ltm", "ct_src_dport_ltm", "ct_dst_sport_ltm", 
+    "ct_dst_src_ltm", "attack_cat", "label"
+]
+raw_df = spark.read.csv("hdfs://localhost:9000/user/raaf09/spark/UNSW-NB15.csv", inferSchema=True)
+df = raw_df.toDF(*all_columns).na.drop(subset=["proto", "label"])
+
+# 3. Feature Engineering
+# Indexing categorical features and assembling into a feature vector
+indexers = [
+    StringIndexer(inputCol="proto", outputCol="proto_idx", handleInvalid="skip"),
+    StringIndexer(inputCol="state", outputCol="state_idx", handleInvalid="skip")
+]
+feature_cols = ["dur", "sbytes", "dbytes", "sttl", "dttl", "proto_idx", "state_idx"]
+assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+
+# 4. Model Design and Configuration
+# We use standard regularization to prevent overfitting on the large dataset
+lr = LogisticRegression(featuresCol="features", labelCol="label", maxIter=10, regParam=0.3)
+
+# 5. Build and Train Pipeline
+pipeline = Pipeline(stages=indexers + [assembler, lr])
+train_data, test_data = df.randomSplit([0.8, 0.2], seed=42)
+model = pipeline.fit(train_data)
+
+# 6. Evaluation
+predictions = model.transform(test_data)
+evaluator = BinaryClassificationEvaluator(labelCol="label", metricName="areaUnderROC")
+auroc = evaluator.evaluate(predictions)
+
+print(f"Numerical Result - Area Under ROC: {auroc:.4f}")
+
+# 7. Graphical Representation
+# Plotting a confusion matrix summary locally
+counts = predictions.groupBy("label", "prediction").count().toPandas()
+plt.figure(figsize=(8, 6))
+sns.heatmap(counts.pivot(index="label", columns="prediction", values="count"), annot=True, fmt='d', cmap='Blues')
+plt.title("Confusion Matrix: Binary Classifier")
+plt.savefig('/home/raaf09/binary_confusion_matrix.png')
+spark.stop()
