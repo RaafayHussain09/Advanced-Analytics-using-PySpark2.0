@@ -1,0 +1,198 @@
+import matplotlib
+matplotlib.use('Agg')  # MUST be the very first Matplotlib call
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import pandas as pd
+from pyspark.sql import SparkSession, functions as F
+from pyspark.ml.feature import StringIndexer, VectorAssembler
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml import Pipeline
+
+# 1. INITIALIZE SPARK
+spark = SparkSession.builder \
+    .appName("Task3_MultiClass_Final") \
+    .config("spark.executor.heartbeatInterval", "120s") \
+    .config("spark.network.timeout", "800s") \
+    .config("spark.rpc.askTimeout", "800s") \
+    .config("spark.driver.maxResultSize", "2g") \
+    .getOrCreate()
+
+print("Spark session initialized successfully")
+
+# 2. DEFINE COLUMNS AND LOAD DATA
+all_columns = ["srcip", "sport", "dstip", "dsport", "proto", "state", "dur", "sbytes", "dbytes", "sttl", "dttl", 
+               "sloss", "dloss", "service", "Sload", "Dload", "Spkts", "Dpkts", "swin", "dwin", "stcpb", "dtcpb", 
+               "smeansz", "dmeansz", "trans_depth", "res_bdy_len", "Sjit", "Djit", "Stime", "Ltime", "Sintpkt", 
+               "Dintpkt", "tcprtt", "synack", "ackdat", "is_sm_ips_ports", "ct_state_ttl", "ct_flw_http_mthd", 
+               "is_ftp_login", "ct_ftp_cmd", "ct_srv_src", "ct_srv_dst", "ct_dst_ltm", "ct_src_ltm", 
+               "ct_src_dport_ltm", "ct_dst_sport_ltm", "ct_dst_src_ltm", "attack_cat", "label"]
+
+try:
+    raw_df = spark.read.csv("hdfs://localhost:9000/user/raaf09/spark/UNSW-NB15.csv", inferSchema=True)
+    print(f"Dataset loaded successfully. Row count: {raw_df.count()}")
+    
+    # Clean data
+    df = raw_df.toDF(*all_columns).na.drop(subset=["proto", "attack_cat"])
+    print(f"Data after cleaning: {df.count()} rows")
+    
+    # Show sample data
+    print("Sample of attack categories:")
+    df.select("attack_cat").distinct().show(10)
+    
+except Exception as e:
+    print(f"Error loading data: {e}")
+    spark.stop()
+    exit()
+
+# 3. PREPROCESSING
+print("Preprocessing data...")
+indexers = [
+    StringIndexer(inputCol="proto", outputCol="proto_idx", handleInvalid="skip"),
+    StringIndexer(inputCol="service", outputCol="service_idx", handleInvalid="skip"),
+    StringIndexer(inputCol="state", outputCol="state_idx", handleInvalid="skip"),
+    StringIndexer(inputCol="attack_cat", outputCol="label_multi_index", handleInvalid="skip")
+]
+
+# Convert indexers first to get indexed columns
+for indexer in indexers:
+    df = indexer.fit(df).transform(df)
+
+feature_cols = ["dur", "sbytes", "dbytes", "sttl", "dttl", "proto_idx", "service_idx", "state_idx"]
+assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+
+# 4. MULTI-CLASS MODEL (Random Forest)
+rf = RandomForestClassifier(labelCol="label_multi_index", featuresCol="features", 
+                            numTrees=15, maxBins=200, seed=42)
+
+# 5. TRAIN PIPELINE
+print("Training model...")
+pipeline = Pipeline(stages=[assembler, rf])  # Indexers already applied
+train_data, test_data = df.randomSplit([0.8, 0.2], seed=42)
+model = pipeline.fit(train_data)
+predictions = model.transform(test_data)
+
+print(f"Predictions count: {predictions.count()}")
+
+# 6. EVALUATE
+evaluator = MulticlassClassificationEvaluator(labelCol="label_multi_index", metricName="accuracy")
+accuracy = evaluator.evaluate(predictions)
+print(f"Multi-class Accuracy: {accuracy:.4f}")
+
+# Additional metrics
+evaluator_f1 = MulticlassClassificationEvaluator(labelCol="label_multi_index", metricName="f1")
+f1_score = evaluator_f1.evaluate(predictions)
+print(f"Multi-class F1 Score: {f1_score:.4f}")
+
+print("----------- GENERATING VISUALIZATION --------------")
+
+# 1. Get class labels mapping for better visualization
+label_mapping = df.select("attack_cat", "label_multi_index").distinct().orderBy("label_multi_index").collect()
+label_dict = {row['label_multi_index']: row['attack_cat'] for row in label_mapping}
+print(f"Class mapping: {label_dict}")
+
+# 2. Create confusion matrix data
+conf_matrix_data = predictions.groupBy("label_multi_index", "prediction").count()
+
+# Show the raw confusion matrix data
+print("Confusion matrix raw data:")
+conf_matrix_data.show(20)
+
+# 3. Convert to pandas for visualization
+pandas_conf = conf_matrix_data.toPandas()
+print(f"Pandas confusion matrix shape: {pandas_conf.shape}")
+print("Pandas data preview:")
+print(pandas_conf.head())
+
+if pandas_conf.empty:
+    print("Error: No prediction data found to plot!")
+else:
+    try:
+        # Fill missing combinations with 0
+        # Get all unique class indices
+        all_classes = sorted(set(pandas_conf['label_multi_index'].tolist() + pandas_conf['prediction'].tolist()))
+        
+        # Create a complete DataFrame with all combinations
+        complete_data = []
+        for actual in all_classes:
+            for predicted in all_classes:
+                complete_data.append({'label_multi_index': actual, 'prediction': predicted})
+        
+        complete_df = pd.DataFrame(complete_data)
+        
+        # Merge with actual counts, filling missing with 0
+        merged_df = pd.merge(complete_df, pandas_conf, 
+                           on=['label_multi_index', 'prediction'], 
+                           how='left')
+        merged_df['count'] = merged_df['count'].fillna(0)
+        
+        # Create pivot table
+        conf_matrix_pivot = merged_df.pivot_table(
+            index='label_multi_index', 
+            columns='prediction', 
+            values='count', 
+            fill_value=0
+        )
+        
+        print(f"Confusion matrix shape after pivot: {conf_matrix_pivot.shape}")
+        
+        # 4. Create visualization
+        plt.figure(figsize=(14, 12))
+        
+        # Create heatmap
+        sns.heatmap(conf_matrix_pivot, 
+                    annot=True, 
+                    fmt='d', 
+                    cmap='Blues',
+                    cbar_kws={'label': 'Count'},
+                    linewidths=0.5,
+                    linecolor='gray')
+        
+        # Create readable labels if possible
+        if len(label_dict) <= 20:  # Only if reasonable number of classes
+            # Get tick labels
+            xtick_labels = [label_dict.get(i, f'Class {i}') for i in conf_matrix_pivot.columns]
+            ytick_labels = [label_dict.get(i, f'Class {i}') for i in conf_matrix_pivot.index]
+            
+            plt.xticks(ticks=range(len(xtick_labels)), labels=xtick_labels, rotation=45, ha='right')
+            plt.yticks(ticks=range(len(ytick_labels)), labels=ytick_labels, rotation=0)
+        else:
+            plt.xlabel("Predicted Class Index")
+            plt.ylabel("Actual Class Index")
+        
+        plt.title(f"Multi-Class Classifier Confusion Matrix\nAccuracy: {accuracy:.4f}, F1 Score: {f1_score:.4f}", 
+                 fontsize=16, pad=20)
+        plt.tight_layout()
+
+        # 5. Save the plot
+        save_path = '/home/raaf09/multi_class_confusion_matrix.png'
+        
+        if os.path.exists(save_path):
+            os.remove(save_path)
+            
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"SUCCESS: Graph saved as {save_path}")
+        
+        # Also save a text version of the confusion matrix
+        txt_path = '/home/raaf09/confusion_matrix.txt'
+        with open(txt_path, 'w') as f:
+            f.write(f"Multi-class Classification Results\n")
+            f.write(f"Accuracy: {accuracy:.4f}\n")
+            f.write(f"F1 Score: {f1_score:.4f}\n\n")
+            f.write("Confusion Matrix:\n")
+            f.write(conf_matrix_pivot.to_string())
+        
+        print(f"Text results saved as {txt_path}")
+        
+        # Show the plot
+        plt.show()
+        
+    except Exception as e:
+        print(f"Error creating visualization: {e}")
+        import traceback
+        traceback.print_exc()
+
+# 6. Stop Spark session
+spark.stop()
+print("Spark session stopped")
